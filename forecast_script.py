@@ -1,17 +1,16 @@
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from dateutil.relativedelta import relativedelta
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
-from sklearn.neural_network import MLPRegressor
-from sklearn.metrics import mean_squared_error
-from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
-import os
-import warnings
+from plotting_utils import visualize_data, plot_results, plot_training_history
+from utils import create_seasonal_features_filtered, load_data, filter_last_n_years, prepare_seasonal_data
 
-from scikeras.wrappers import KerasRegressor
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from statsmodels.tsa.seasonal import seasonal_decompose
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
+from sklearn.metrics import mean_squared_error
+from tensorflow.keras.callbacks import EarlyStopping, Callback
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Input
+from tensorflow.keras.layers import SimpleRNN, GRU, LSTM, Dense
 
 def plot_line_graph(x_data_list, y_data_list, labels, title, x_label, y_label, legend_labels, output_path, figure_size=(14,7)):
     plt.figure(figsize=figure_size)
@@ -20,8 +19,9 @@ def plot_line_graph(x_data_list, y_data_list, labels, title, x_label, y_label, l
     plt.title(title)
     plt.xlabel(x_label)
     plt.ylabel(y_label)
-    plt.legend()
+    plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
     plt.tight_layout()
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     plt.savefig(output_path)
     plt.close()
 
@@ -33,22 +33,9 @@ def plot_heatmap(data, title, x_tick_labels, y_tick_labels, output_path, figure_
     plt.colorbar()
     plt.title(title, pad=20)
     plt.tight_layout()
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     plt.savefig(output_path)
     plt.close()
-
-def load_data(file_path):
-    try:
-        data = pd.read_csv(file_path)
-    except Exception as e:
-        print(f"Error reading file {file_path}: {e}")
-        return None
-    if 'Date' not in data.columns:
-        print(f"'Date' column missing in {file_path}.")
-        return None
-    data['Date'] = pd.to_datetime(data['Date'])
-    data.set_index('Date', inplace=True)
-    data.sort_index(inplace=True)
-    return data
 
 def visualize_data(data, currency, output_dir):
     close_col = f'Close_{currency}'
@@ -76,61 +63,146 @@ def visualize_data(data, currency, output_dir):
         figure_size=(12, 10)
     )
 
-def create_features_filtered(data, currency, use_short_term_lag=True, use_long_term_lag=True, short_term_lag=60,
-                             long_term_lag=360):
+def decompose_time_series(data, currency, output_dir):
     close_col = f'Close_{currency}'
-    feature_cols = []
-    if use_short_term_lag:
-        data[f'Close_Lag_{short_term_lag}'] = data[close_col].shift(short_term_lag)
-        feature_cols.append(f'Close_Lag_{short_term_lag}')
-    if use_long_term_lag:
-        data[f'Close_Lag_{long_term_lag}'] = data[close_col].shift(long_term_lag)
-        feature_cols.append(f'Close_Lag_{long_term_lag}')
-    data['MA_5'] = data[close_col].rolling(window=5).mean()
-    feature_cols += ['MA_5']
-    gdp_features = [col for col in data.columns if col.startswith('GDP_Growth_Percentage')]
-    if gdp_features:
-        feature_cols += gdp_features
-    data = data.dropna()
-    X = data[feature_cols].copy()
-    y = data[close_col].copy()
-    return X, y
+    result = seasonal_decompose(data[close_col], model='multiplicative', period=252)
+    plt.figure(figsize=(15, 10))
+    plt.subplot(411)
+    plt.title('Original Time Series')
+    plt.plot(data.index, result.observed)
+    plt.subplot(412)
+    plt.title('Trend')
+    plt.plot(data.index, result.trend)
+    plt.subplot(413)
+    plt.title('Seasonal')
+    plt.plot(data.index, result.seasonal)
+    plt.subplot(414)
+    plt.title('Residual')
+    plt.plot(data.index, result.resid)
+    plt.tight_layout()
+    os.makedirs(output_dir, exist_ok=True)
+    plt.savefig(os.path.join(output_dir, f'{currency}_seasonal_decomposition.png'))
+    plt.close()
+    return result
+
+def plot_results(currency, y_train_seq, y_test_plot, predictions, y_train_dates, y_test_dates, scaler_y, currency_output_dir, dataset_time):
+    y_train_plot = scaler_y.inverse_transform(y_train_seq.reshape(-1, 1)).flatten()
+    forecast_plot_path = os.path.join(currency_output_dir, f'{currency}_forecast.png')
+    plot_line_graph(
+        x_data_list=[y_train_dates, y_test_dates, y_test_dates],
+        y_data_list=[y_train_plot, y_test_plot, predictions],
+        labels=['Training Data', 'Actual Prices', 'Predicted Prices'],
+        title=f'{currency} Closing Price Prediction (Last {dataset_time} Years)',
+        x_label='Date',
+        y_label='Price',
+        legend_labels=['Training Data', 'Actual Prices', 'Predicted Prices'],
+        output_path=forecast_plot_path,
+        figure_size=(20, 10)
+    )
+    comparison_plot_path = os.path.join(currency_output_dir, f'{currency}_actual_vs_predicted.png')
+    plot_line_graph(
+        x_data_list=[y_test_dates, y_test_dates],
+        y_data_list=[y_test_plot, predictions],
+        labels=['Actual Prices', 'Predicted Prices'],
+        title=f'{currency} Actual vs Predicted Prices (Test Set)',
+        x_label='Date',
+        y_label='Price',
+        legend_labels=['Actual Prices', 'Predicted Prices'],
+        output_path=comparison_plot_path,
+        figure_size=(20, 10)
+    )
+
+def plot_training_history(history, output_dir, currency):
+    loss = history.history.get('loss', [])
+    val_loss = history.history.get('val_loss', [])
+    if not loss:
+        return
+    plt.figure(figsize=(14, 7))
+    plt.plot(loss, label='Training Loss')
+    if val_loss:
+        plt.plot(val_loss, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title(f'{currency} Training History')
+    plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, f'{currency}_training_history.png')
+    plt.savefig(plot_path)
+    plt.close()
+
+class DetailedLoggingCallback(Callback):
+    def __init__(self, model_counter, total_models):
+        super().__init__()
+        self.model_counter = model_counter
+        self.total_models = total_models
+
+    def on_train_begin(self, logs=None):
+        print(f"\nStarting training model {self.model_counter.count} of {self.total_models}")
+
+    def on_epoch_end(self, epoch, logs=None):
+        if logs is not None:
+            val_loss = logs.get('val_loss')
+            print(f"Model {self.model_counter.count} | Epoch {epoch + 1}: val_loss: {val_loss:.4f}")
+
+class ModelCounter:
+    def __init__(self, total):
+        self.count = 0
+        self.total = total
+
+    def increment(self):
+        self.count += 1
+        return self.count
+
+def create_rnn_model(rnn_type='LSTM', n_layers=1, units=50, activation='tanh', optimizer='adam', input_shape=None):
+    if input_shape is None:
+        raise ValueError("input_shape must be specified")
+    model = Sequential()
+    for i in range(n_layers):
+        return_sequences = True if i < n_layers - 1 else False
+        if rnn_type == 'LSTM':
+            model.add(
+                LSTM(units=units, activation=activation, input_shape=input_shape, return_sequences=return_sequences))
+        elif rnn_type == 'GRU':
+            model.add(
+                GRU(units=units, activation=activation, input_shape=input_shape, return_sequences=return_sequences))
+        else:
+            model.add(SimpleRNN(units=units, activation=activation, input_shape=input_shape, return_sequences=return_sequences))
+    model.add(Dense(1))
+    model.compile(loss='mean_squared_error', optimizer=optimizer)
+    return model
 
 def create_lstm_sequences(X, y, sequence_length=1):
     X_seq = []
     y_seq = []
     for i in range(len(X) - sequence_length):
-        X_seq.append(X.iloc[i:i+sequence_length].values)
-        y_seq.append(y.iloc[i+sequence_length])
+        X_seq.append(X.iloc[i:i + sequence_length].values)
+        y_seq.append(y.iloc[i + sequence_length])
     return np.array(X_seq), np.array(y_seq)
 
-def filter_last_n_years(data, n_years=6):
-    latest_date = data.index.max()
-    start_date = latest_date - relativedelta(years=n_years)
-    filtered_data = data.loc[start_date:latest_date].copy()
-    return filtered_data
-
-def forecast_currency(currency, combined_data_dir, output_dir, scaling_method='standard', forecasting_type='direct',
-                      dataset_time=6, prediction_time=180, short_term_lag=60, long_term_lag=360):
+def load_and_prepare_data(currency, combined_data_dir, output_dir, scaling_method, dataset_time, short_term_lag, long_term_lag):
     file_name = f'combined_data_{currency}.csv'
     file_path = os.path.join(combined_data_dir, file_name)
     if not os.path.exists(file_path):
-        print(f"Combined data file for {currency} not found at {file_path}. Skipping.")
-        return
-    currency_output_dir = os.path.join(output_dir, currency)
-    os.makedirs(currency_output_dir, exist_ok=True)
-    data = load_data(file_path)
+        print(f"Combined data file for {currency} not found at {file_path}.")
+        return None, None, None, None
+    data = pd.read_csv(file_path, index_col=0, parse_dates=True)
     if data is None or data.empty:
-        print(f"No data available for {currency}. Skipping.")
-        return
-    data = data.drop(columns=['Day_of_week'], errors='ignore')
-    visualize_data(data, currency, currency_output_dir)
+        print(f"No data available for {currency}.")
+        return None, None, None, None
+    data = data.drop(columns=['Day_of_Week'], errors='ignore')
+    data = prepare_seasonal_data(data, currency, output_dir)
     filtered_data = filter_last_n_years(data, n_years=dataset_time)
     if filtered_data.empty:
-        print(f"Filtered data for {currency} is empty. Skipping.")
-        return
-    print(f"Filtered Data Range for {currency}: {filtered_data.index.min().date()} to {filtered_data.index.max().date()}")
-    X, y = create_features_filtered(
+        print(f"Filtered data for {currency} is empty.")
+        return None, None, None, None
+    scaler_options = {
+        'standard': StandardScaler(),
+        'normalize': MinMaxScaler(),
+        'robust': RobustScaler()
+    }
+    scaler_X = scaler_options.get(scaling_method, StandardScaler())
+    scaler_y = StandardScaler()
+    X, y = create_seasonal_features_filtered(
         filtered_data,
         currency=currency,
         use_short_term_lag=True,
@@ -139,120 +211,198 @@ def forecast_currency(currency, combined_data_dir, output_dir, scaling_method='s
         long_term_lag=long_term_lag
     )
     if X.empty or y.empty:
-        print(f"No features/target available after filtering for {currency}. Skipping.")
+        print(f"No features/target available for {currency}.")
+        return None, None, None, None
+    return X, y, scaler_X, scaler_y
+
+def train_rnn_models(X_train_seq, y_train_seq, X_val_seq, y_val_seq, sequence_length, param_grid, model_counter, total_models):
+    results = []
+    histories = []
+    from itertools import product
+    keys = list(param_grid.keys())
+    values = list(param_grid.values())
+    param_combinations = list(product(*values))
+    for params in param_combinations:
+        param_dict = dict(zip(keys, params))
+        model_counter.increment()
+        print(f"\nTraining model {model_counter.count} of {total_models}: {param_dict}")
+        model = create_rnn_model(
+            rnn_type=param_dict['rnn_type'],
+            n_layers=param_dict['n_layers'],
+            units=param_dict['units'],
+            activation=param_dict['activation'],
+            optimizer=param_dict['optimizer'],
+            input_shape=(sequence_length, X_train_seq.shape[2])
+        )
+        logging_callback = DetailedLoggingCallback(model_counter, total_models)
+        early_stopping = EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True, verbose=1)
+        history = model.fit(
+            X_train_seq, y_train_seq,
+            validation_data=(X_val_seq, y_val_seq),
+            epochs=param_dict['epochs'],
+            batch_size=param_dict['batch_size'],
+            callbacks=[early_stopping],
+            verbose=1
+        )
+        val_mse = min(history.history['val_loss'])
+        results.append({
+            'params': param_dict,
+            'val_mse': val_mse,
+            'history': history
+        })
+        histories.append(history)
+    return results, histories
+
+def plot_validation_losses(histories, param_combinations, currency, output_dir):
+    plt.figure(figsize=(20, 10))
+    for history, params in zip(histories, param_combinations):
+        epochs = range(1, len(history.history['val_loss']) + 1)
+        plt.plot(epochs, history.history['val_loss'], label=str(params))
+    plt.title(f'Validation Loss per Epoch for Different Model Configurations - {currency}')
+    plt.xlabel('Epoch')
+    plt.ylabel('Validation Loss')
+    plt.legend(loc='upper left', bbox_to_anchor=(1, 1), fontsize='small')
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, f'{currency}_validation_losses_per_epoch.png')
+    plt.savefig(plot_path)
+    plt.close()
+    print(f"Validation losses per epoch plot saved to {plot_path}")
+
+def make_predictions(best_model, X_test_seq, y_test_seq, scaler_y):
+    predictions_scaled = best_model.predict(X_test_seq)
+    predictions_scaled = pd.Series(predictions_scaled.flatten()).rolling(window=5, min_periods=1).mean().values
+    predictions = scaler_y.inverse_transform(predictions_scaled.reshape(-1, 1)).flatten()
+    y_test_plot = scaler_y.inverse_transform(y_test_seq.reshape(-1, 1)).flatten()
+    return predictions, y_test_plot
+
+def forecast_currency_with_seasonal_data(sequence_length, currency, combined_data_dir, output_dir,
+                                         scaling_method='standard', forecasting_type='recursive',
+                                         dataset_time=6, prediction_time=180,
+                                         short_term_lag=60, long_term_lag=360, param_grid=None):
+    currency_output_dir = os.path.join(output_dir, currency)
+    os.makedirs(currency_output_dir, exist_ok=True)
+    X, y, scaler_X, scaler_y = load_and_prepare_data(currency, combined_data_dir, output_dir, scaling_method,
+                                                     dataset_time, short_term_lag, long_term_lag)
+    if X is None:
         return
-    feature_columns = X.columns.tolist()
-    scaler_options = {
-        'standard': StandardScaler(),
-        'normalize': MinMaxScaler(),
-        'robust': RobustScaler()
-    }
-    scaler = scaler_options.get(scaling_method, StandardScaler())
-    scaler.fit(X)
-    X_scaled = scaler.transform(X)
-    X_scaled_df = pd.DataFrame(X_scaled, columns=feature_columns, index=X.index)
+    visualize_data(pd.concat([X, y.rename('Close_' + currency)], axis=1), currency, currency_output_dir)
     if forecasting_type == 'recursive':
-        sequence_length = 10
         test_period_days = prediction_time
-        train_size = len(X_scaled_df) - test_period_days - sequence_length
+        train_size = len(X) - test_period_days - sequence_length
         if train_size <= 0:
-            print(f"Not enough data to train for {currency}. Skipping.")
+            print(f"Not enough data to train for {currency}.")
             return
-        X_train_df = X_scaled_df.iloc[:train_size + sequence_length]
-        X_test_df = X_scaled_df.iloc[train_size:]
+        X_train_df = X.iloc[:train_size + sequence_length]
+        X_val_df = X.iloc[train_size:]
         y_train_series = y.iloc[:train_size + sequence_length]
-        y_test_series = y.iloc[train_size:]
-        X_train_seq, y_train_seq = create_lstm_sequences(X_train_df, y_train_series, sequence_length)
-        X_test_seq, y_test_seq = create_lstm_sequences(X_test_df, y_test_series, sequence_length)
-        if len(X_test_seq) == 0:
-            print(f"Not enough test sequences after adjustment for {currency}. Skipping.")
+        y_val_series = y.iloc[train_size:]
+        scaler_X.fit(X_train_df)
+        X_train_scaled = scaler_X.transform(X_train_df)
+        X_val_scaled = scaler_X.transform(X_val_df)
+        scaler_y.fit(y_train_series.values.reshape(-1, 1))
+        y_train_scaled = scaler_y.transform(y_train_series.values.reshape(-1, 1)).flatten()
+        y_val_scaled = scaler_y.transform(y_val_series.values.reshape(-1, 1)).flatten()
+        X_train_seq, y_train_seq = create_lstm_sequences(
+            pd.DataFrame(X_train_scaled, columns=X.columns, index=X_train_df.index),
+            pd.Series(y_train_scaled, index=y_train_series.index),
+            sequence_length
+        )
+        X_val_seq, y_val_seq = create_lstm_sequences(
+            pd.DataFrame(X_val_scaled, columns=X.columns, index=X_val_df.index),
+            pd.Series(y_val_scaled, index=y_val_series.index),
+            sequence_length
+        )
+        if len(X_val_seq) == 0:
+            print(f"Not enough validation sequences after adjustment for {currency}.")
             return
-        print(f"Training set size for {currency}: {X_train_seq.shape[0]}")
-        print(f"Testing set size for {currency}: {X_test_seq.shape[0]}")
-        def create_lstm_model(units=50, activation='tanh', optimizer='adam'):
-            model = Sequential()
-            model.add(Input(shape=(X_train_seq.shape[1], X_train_seq.shape[2])))
-            model.add(LSTM(units=units, activation=activation))
-            model.add(Dense(1))
-            model.compile(loss='mean_squared_error', optimizer=optimizer)
-            return model
-        model = KerasRegressor(model=create_lstm_model, verbose=1)
-        param_grid = {
-            'model__units': [50, 100],
-            'model__activation': ['relu'],
-            'optimizer': ['adam'],
-            'batch_size': [16],
-            'epochs': [100]
-        }
-        tscv = TimeSeriesSplit(n_splits=3)
-        warnings.filterwarnings('ignore')
-        grid_search = GridSearchCV(
-            estimator=model,
-            param_grid=param_grid,
-            scoring='neg_mean_squared_error',
-            cv=tscv,
-            verbose=1,
-            n_jobs=-1
+        total_models = 1
+        for v in param_grid.values():
+            total_models *= len(v)
+        model_counter = ModelCounter(total_models)
+        print(f"Starting manual grid search for {currency} (Recursive Forecasting with RNN)...")
+        results, histories = train_rnn_models(
+            X_train_seq, y_train_seq, X_val_seq, y_val_seq,
+            sequence_length, param_grid, model_counter, total_models
         )
-        print(f"Starting GridSearchCV for {currency} (Recursive Forecasting with LSTM)...")
-        grid_search.fit(X_train_seq, y_train_seq)
-        print(f"Completed GridSearchCV for {currency}.")
-        best_model = grid_search.best_estimator_
-        print(f"Best Parameters for {currency} LSTM: {grid_search.best_params_}")
-        print(f"Best Cross-Validation Score for {currency} LSTM: {grid_search.best_score_}")
-        predictions = best_model.predict(X_test_seq)
-        predictions = pd.Series(predictions).rolling(window=5, min_periods=1).mean().values
-        y_train_plot = y.iloc[sequence_length:train_size + sequence_length]
-        y_test_plot = y.iloc[train_size + sequence_length:]
-        test_dates = y_test_plot.index
-        assert len(y_test_seq) == len(predictions) == len(test_dates), "Lengths of test data do not match."
-        forecast_plot_path = os.path.join(currency_output_dir, f'{currency}_forecast.png')
-        plot_line_graph(
-            x_data_list=[y_train_plot.index, test_dates, test_dates],
-            y_data_list=[y_train_seq, y_test_seq, predictions],
-            labels=['Training Data', 'Actual Prices', 'Predicted Prices'],
-            title=f'{currency} Closing Price Prediction (Last {dataset_time} Years)',
-            x_label='Date',
-            y_label='Price',
-            legend_labels=['Training Data', 'Actual Prices', 'Predicted Prices'],
-            output_path=forecast_plot_path,
-            figure_size=(14, 7)
+        param_combinations = [result['params'] for result in results]
+        plot_validation_losses([result['history'] for result in results], param_combinations, currency, currency_output_dir)
+        print(f"Completed manual grid search for {currency}.")
+        best_result = min(results, key=lambda x: x['val_mse'])
+        best_params = best_result['params']
+        best_history = best_result['history']
+        print(f"Best Parameters for {currency} RNN: {best_params}")
+        print(f"Best Validation MSE for {currency} RNN: {best_result['val_mse']}")
+        best_model = create_rnn_model(
+            rnn_type=best_params['rnn_type'],
+            n_layers=best_params['n_layers'],
+            units=best_params['units'],
+            activation=best_params['activation'],
+            optimizer=best_params['optimizer'],
+            input_shape=(sequence_length, X_train_seq.shape[2])
         )
-        comparison_plot_path = os.path.join(currency_output_dir, f'{currency}_actual_vs_predicted.png')
-        plot_line_graph(
-            x_data_list=[test_dates, test_dates],
-            y_data_list=[y_test_seq, predictions],
-            labels=['Actual Prices', 'Predicted Prices'],
-            title=f'{currency} Actual vs Predicted Prices (Test Set)',
-            x_label='Date',
-            y_label='Price',
-            legend_labels=['Actual Prices', 'Predicted Prices'],
-            output_path=comparison_plot_path,
-            figure_size=(14, 7)
+        best_model.fit(
+            X_train_seq, y_train_seq,
+            validation_data=(X_val_seq, y_val_seq),
+            epochs=best_params['epochs'],
+            batch_size=best_params['batch_size'],
+            callbacks=[
+                EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=1)
+            ],
+            verbose=0
         )
-        mse = mean_squared_error(y_test_seq, predictions)
+        predictions, y_val_plot = make_predictions(best_model, X_val_seq, y_val_seq, scaler_y)
+        y_test_dates = y_val_series.index[sequence_length:]
+        assert len(y_val_seq) == len(predictions) == len(y_test_dates), "Lengths of test data do not match."
+        plot_results(
+            currency, y_train_seq, y_val_plot, predictions,
+            y_train_series.index[sequence_length:], y_test_dates,
+            scaler_y, currency_output_dir, dataset_time
+        )
+        mse = mean_squared_error(y_val_plot, predictions)
+        rmse = np.sqrt(mse)
         print(f'Mean Squared Error for {currency}: {mse}')
+        print(f'Root Mean Squared Error for {currency}: {rmse}')
         mse_file = os.path.join(currency_output_dir, f'{currency}_mse.txt')
         with open(mse_file, 'w') as f:
-            f.write(f'Mean Squared Error: {mse}\n')
-        print(f"MSE saved to {mse_file}.")
+            header = "Rank, Parameters, Mean MSE, RMSE\n"
+            f.write(header)
+            sorted_results = sorted(results, key=lambda x: x['val_mse'])
+            for rank, result in enumerate(sorted_results, start=1):
+                params_str = '; '.join([f"{k}: {v}" for k, v in result['params'].items()])
+                mean_mse = result['val_mse']
+                rmse_val = np.sqrt(mean_mse)
+                line = f"{rank}, {params_str}, {mean_mse:.6f}, {rmse_val:.6f}\n"
+                f.write(line)
+        print(f"All tested parameters and their MSEs have been logged to {mse_file}.")
+        print(f"MSE and RMSE saved to {mse_file}.")
     else:
         print(f"Invalid forecasting type '{forecasting_type}' for {currency}. Skipping predictions.")
-        return
 
 def main():
-    currency = 'USDPLN=X'
+    currency = 'USDJPY=X'
     scaling_method = 'standard'
     forecasting_type = 'recursive'
     combined_data_dir = 'combined_data'
     output_dir = 'forecasting_outputs'
+    sequence_length = 14
     dataset_time = 6
-    prediction_time = 180
+    prediction_time = 90
     short_term_lag = 7
-    long_term_lag = 90
+    long_term_lag = 30
+    param_grid = {
+        'rnn_type': ['LSTM'],
+        'n_layers': [1],
+        'units': [50],
+        'activation': [ 'relu'],
+        'optimizer': ['adam'],
+        'batch_size': [32],
+        'epochs': [50]
+    }
     os.makedirs(output_dir, exist_ok=True)
-    forecast_currency(currency, combined_data_dir, output_dir, scaling_method, forecasting_type,
-                      dataset_time, prediction_time, short_term_lag, long_term_lag)
+    forecast_currency_with_seasonal_data(
+        sequence_length, currency, combined_data_dir, output_dir, scaling_method, forecasting_type,
+        dataset_time, prediction_time, short_term_lag, long_term_lag, param_grid
+    )
 
 if __name__ == "__main__":
     main()

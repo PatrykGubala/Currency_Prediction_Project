@@ -1,1 +1,2 @@
-Mean Squared Error: 1.9946346609572598
+Rank, Parameters, Mean MSE, RMSE
+1, rnn_type: LSTM; n_layers: 1; units: 50; activation: relu; optimizer: adam; batch_size: 32; epochs: 50, 0.011614, 0.107769
