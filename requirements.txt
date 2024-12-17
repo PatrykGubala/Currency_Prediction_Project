@@ -54,3 +54,4 @@ wrapt==1.16.0
 
 scikeras~=0.13.0
 yfinance~=0.2.49
+statsmodels~=0.14.4
